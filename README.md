@@ -94,6 +94,10 @@ clothing_variant_generator/
 └── docs/                           # installation / usage / developer guides
 ```
 
+## Author
+
+Created by **Jayesh Puri Goswami**.
+
 ## License
 
 No license has been added yet — add one (MIT is a common default for
