@@ -20,7 +20,3 @@ from . import ui
 def show():
     """Open (or bring forward) the Clothing Variant Generator window."""
     return ui.show()
-
-
-if __name__ == "__main__":
-    show()

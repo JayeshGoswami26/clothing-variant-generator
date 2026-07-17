@@ -13,6 +13,10 @@ from contextlib import contextmanager
 
 import maya.cmds as cmds
 
+from . import config
+
+TEMP_WILDCARD = config.TEMP_PREFIX + "*"
+
 
 class MeshValidationError(Exception):
     """Raised when a mesh fails validation (missing, wrong type, etc.)."""
@@ -35,6 +39,60 @@ def undo_chunk(chunk_name="ClothingVariantOp"):
         yield
     finally:
         cmds.undoInfo(closeChunk=True)
+
+
+# ---------------------------------------------------------------------------
+# Viewport suspension
+#
+# Redrawing the viewport after every duplicate/rename/delete during a
+# batch costs far more than the geometry work itself. Suspending refresh
+# for the duration of a batch is the single biggest speed win available
+# without touching the deformation algorithm.
+#
+# These are module-level (not a context manager) because the batch is
+# driven one task per QTimer tick, so it spans many callbacks and cannot
+# live inside a single `with` block.
+# ---------------------------------------------------------------------------
+_viewport_suspended = False
+
+
+def is_viewport_suspended():
+    return _viewport_suspended
+
+
+def suspend_viewport(logger=None):
+    """Pause viewport redraw. Safe to call twice; never raises."""
+    global _viewport_suspended
+    if _viewport_suspended:
+        return
+    try:
+        cmds.refresh(suspend=True)
+        _viewport_suspended = True
+    except RuntimeError as exc:
+        if logger:
+            logger.warning("Could not suspend viewport refresh: %s" % exc)
+
+
+def resume_viewport(logger=None):
+    """
+    Resume viewport redraw and force one repaint. Safe to call twice, and
+    safe to call when suspend never happened.
+
+    The flag is cleared BEFORE the Maya call: if `refresh` itself throws,
+    we must not stay latched in the "suspended" state, or every later
+    resume would no-op and leave the artist staring at a frozen viewport
+    for the rest of the session.
+    """
+    global _viewport_suspended
+    if not _viewport_suspended:
+        return
+    _viewport_suspended = False
+    try:
+        cmds.refresh(suspend=False)
+        cmds.refresh(force=True)
+    except RuntimeError as exc:
+        if logger:
+            logger.warning("Could not resume viewport refresh: %s" % exc)
 
 
 # ---------------------------------------------------------------------------
@@ -89,9 +147,9 @@ def topology_matches(mesh_a, mesh_b):
     hash), which is expensive across hundreds of assets. In a body-variant
     pipeline where every body is exported from the same base rig/topology,
     vertex-count parity is a fast and, in practice, reliable proxy for the
-    "identical point order" requirement of Maya's blendShape node. If a
-    studio's variants are NOT guaranteed same-point-order, this check
-    should be swapped for a stricter topology hash comparison.
+    "identical point order" requirement of the transfer. If a studio's
+    variants are NOT guaranteed same-point-order, this check should be
+    swapped for a stricter topology hash comparison.
     """
     count_a = vertex_count(mesh_a)
     count_b = vertex_count(mesh_b)
@@ -114,13 +172,31 @@ def unique_name(desired_name):
 
 
 def strip_namespace(node_name):
-    """Return a node name without any namespace prefix."""
-    return node_name.split(":")[-1]
+    """Return a node name without any namespace prefix or DAG path."""
+    if not node_name:
+        return node_name
+    return node_name.split("|")[-1].split(":")[-1]
 
 
 def sanitize_folder_component(name):
     """Make a string safe to use as a folder / file name component."""
     return re.sub(r"[^A-Za-z0-9_\-]", "_", name)
+
+
+def sanitize_node_name(name):
+    """
+    Make a string safe to use as a Maya node name.
+
+    Maya node names may only contain letters, digits and underscores, and
+    may not start with a digit. Namespaced/pathed source names ("char:shirt",
+    "|grp|shirt") would otherwise produce an invalid rename target.
+    """
+    clean = re.sub(r"[^A-Za-z0-9_]", "_", strip_namespace(name) or "")
+    if not clean:
+        clean = "mesh"
+    if clean[0].isdigit():
+        clean = "_" + clean
+    return clean
 
 
 # ---------------------------------------------------------------------------
@@ -161,10 +237,29 @@ def safe_delete_nodes(node_names, logger=None):
             logger.warning("Could not delete temp nodes %s: %s" % (existing, exc))
 
 
+def delete_leftover_temp_nodes(logger=None):
+    """
+    Delete any node still carrying the tool's temp prefix.
+
+    Nothing should ever survive a normal run, but a Maya crash or a
+    force-quit mid-batch can strand a working duplicate in the scene.
+    Sweeping them at the start of a batch keeps a daily-driver scene from
+    slowly filling with CVG_tmp_* junk.
+    """
+    try:
+        leftovers = cmds.ls(TEMP_WILDCARD, long=True) or []
+    except RuntimeError:
+        return 0
+    if not leftovers:
+        return 0
+    safe_delete_nodes(leftovers, logger)
+    return len(leftovers)
+
+
 def freeze_transform(node_name, logger=None):
     try:
         cmds.makeIdentity(node_name, apply=True, translate=True, rotate=True,
-                           scale=True, normal=False, preserveNormals=True)
+                          scale=True, normal=False, preserveNormals=True)
         return True
     except RuntimeError as exc:
         if logger:
@@ -203,7 +298,35 @@ def get_influences(skin_cluster):
 
 
 # ---------------------------------------------------------------------------
-# Namespace cleanup (nice-to-have: automatic namespace cleanup)
+# Selection
+# ---------------------------------------------------------------------------
+@contextmanager
+def preserved_selection():
+    """
+    Restore the artist's selection afterwards.
+
+    The FBX exporter has to select the mesh it exports (FBXExport -s works
+    on the selection). Silently stealing an artist's selection mid-batch is
+    the kind of small rudeness that makes a tool feel unfinished.
+    """
+    try:
+        previous = cmds.ls(selection=True, long=True) or []
+    except RuntimeError:
+        previous = []
+    try:
+        yield
+    finally:
+        try:
+            if previous:
+                cmds.select([n for n in previous if cmds.objExists(n)], replace=True)
+            else:
+                cmds.select(clear=True)
+        except RuntimeError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Namespace cleanup
 # ---------------------------------------------------------------------------
 def remove_empty_namespaces():
     """Remove any empty namespaces left behind after a batch run."""

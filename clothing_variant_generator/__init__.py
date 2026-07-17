@@ -5,7 +5,13 @@ Clothing Variant Generator
 A Maya plugin for automatically generating clothing variants that fit
 multiple body types in a game character customization pipeline.
 
-See main.py for the entry point used by shelf buttons / userSetup.py.
+    Base Body + Base Clothing + Target Bodies
+        -> fitted clothing variant per body
+        -> (optional) skin weight transfer
+        -> FBX per variant folder
+        -> Unity
+
+See main.py for the entry point used by shelf buttons.
 """
 
 from . import config  # noqa: F401

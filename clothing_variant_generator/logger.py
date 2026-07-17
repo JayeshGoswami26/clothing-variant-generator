@@ -6,8 +6,11 @@ Central logging utility for the Clothing Variant Generator.
 
 Provides a Qt-signal based logger so a live QTextEdit in the UI can
 display progress as it happens, while every line is simultaneously
-buffered in memory and (optionally) streamed to a log.txt file inside
-the chosen output folder.
+streamed to a log.txt file inside the chosen output folder.
+
+Nothing is buffered in memory: the UI owns the on-screen history (with a
+bounded document) and log.txt owns the permanent record, so a
+thousand-asset batch adds no growing Python-side list.
 
 Logging failures (e.g. a locked/unwritable output folder) are always
 caught internally -- a broken log must never crash a batch job.
@@ -46,7 +49,6 @@ class VariantLogger(QObject):
 
     def __init__(self, parent=None):
         super(VariantLogger, self).__init__(parent)
-        self._lines = []
         self.log_file_path = None
 
     # ------------------------------------------------------------------
@@ -73,7 +75,6 @@ class VariantLogger(QObject):
     def _write(self, level, message):
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
         line = "[%s][%s] %s" % (timestamp, level, message)
-        self._lines.append(line)
         self.message_logged.emit(line)
         if self.log_file_path:
             try:
@@ -97,9 +98,3 @@ class VariantLogger(QObject):
 
     def success(self, message):
         self._write(self.LEVEL_SUCCESS, message)
-
-    def full_text(self):
-        return "\n".join(self._lines)
-
-    def clear(self):
-        self._lines = []

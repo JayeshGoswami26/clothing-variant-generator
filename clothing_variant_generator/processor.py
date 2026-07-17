@@ -8,11 +8,10 @@ skeleton.
 
 DEFORMATION ENGINE (Maya API 2.0, no deformers)
 -----------------------------------------------
-The previous Wrap-deformer + BlendShape-driver technique has been fully
-removed. The new engine performs deformation transfer entirely via direct
-mesh-data operations on ``maya.api.OpenMaya`` -- no ``wrap`` node, no
-``blendShape``, no ``shrinkWrap``, no ``deltaMush``, no MEL, no
-``dgeval``. Nothing is added to the DG that needs cleaning up afterwards.
+Deformation transfer is performed entirely via direct mesh-data operations
+on ``maya.api.OpenMaya`` -- no ``wrap`` node, no ``blendShape``, no
+``shrinkWrap``, no ``deltaMush``, no MEL, no ``dgeval``. Nothing is added
+to the DG that needs cleaning up afterwards.
 
 ALGORITHM (per clothing mesh, done ONCE and cached across all targets):
 
@@ -58,22 +57,12 @@ EVALUATION on each Target body (fast, per vertex):
     The full new-point set is written to the working clothing shape in
     one ``MFnMesh.setPoints`` call -- no per-vertex DG round-trip.
 
-CONTRACT WITH THE OUTER PIPELINE (unchanged)
---------------------------------------------
-``_deform_clothing_to_target()`` still returns
-``(working_clothing_transform, temp_nodes_list)``. Because this engine
-creates no helper nodes, ``temp_nodes_list`` is always ``[]``. The rest
-of ``process_one()`` (skin-weight transfer, history delete, freeze,
-centre-pivot, rename, FBX export, scene cleanup) is completely
-untouched, as is ``BatchRunner``, the UI, the exporter, the logger and
-the config.
-
 ASSUMPTIONS (documented up-front so an artist can debug failures):
 
-    * Maya 2025, Python 3, Maya API 2.0.
+    * Maya 2022+, Python 3, Maya API 2.0.
     * Base Body and every Target Body share identical vertex count,
       vertex order, UVs and skeleton. ``utils.topology_matches`` is
-      already the pre-flight guard for this in ``process_one()``.
+      the pre-flight guard for this in ``process_one()``.
     * Clothing meshes have their own (different) topology and are
       already fitted to the Base body.
     * The pipeline is offline: results are baked to plain vertex
@@ -87,7 +76,7 @@ import maya.api.OpenMaya as om
 
 from . import config
 from . import utils
-from . import adjacency
+from .exporter import ExportError
 
 
 class ClothingProcessingError(Exception):
@@ -107,6 +96,61 @@ class TaskResult(object):
         self.exported_path = exported_path
         self.error = error
         self.duration = duration
+
+
+# ---------------------------------------------------------------------------
+# Laplacian smoothing helpers
+#
+# Used only by the optional Smooth Iterations slider. The neighbour list is
+# an O(vertices) topology walk, so it is built once per clothing mesh and
+# cached on the processor instance (NOT module level -- a module-level cache
+# would outlive the window and hold dead mesh data for the whole Maya
+# session).
+# ---------------------------------------------------------------------------
+def _build_vertex_neighbors(shape_path):
+    """Return a list (index = vertex id) of each vertex's connected vertices."""
+    vert_iter = om.MItMeshVertex(shape_path)
+    neighbors = [None] * vert_iter.count()
+    while not vert_iter.isDone():
+        neighbors[vert_iter.index()] = list(vert_iter.getConnectedVertices())
+        vert_iter.next()
+    return neighbors
+
+
+def _laplacian_smooth(points, neighbors, amount, iterations):
+    """
+    Laplacian smoothing of a list of ``(x, y, z)`` tuples. Returns a NEW
+    list; never mutates ``points``, so callers can always fall back to the
+    original.
+
+    ``amount`` is the blend factor per iteration (0 = no change, 1 = fully
+    replaced by the neighbour average). Isolated vertices with no
+    neighbours are left untouched.
+    """
+    if amount <= 0.0 or iterations <= 0:
+        return list(points)
+
+    current = list(points)
+    for _ in range(int(iterations)):
+        next_pts = list(current)
+        for i, nbrs in enumerate(neighbors):
+            if not nbrs:
+                continue
+            sx = sy = sz = 0.0
+            for n in nbrs:
+                nx, ny, nz = current[n]
+                sx += nx
+                sy += ny
+                sz += nz
+            count = len(nbrs)
+            cx, cy, cz = current[i]
+            next_pts[i] = (
+                cx + (sx / count - cx) * amount,
+                cy + (sy / count - cy) * amount,
+                cz + (sz / count - cz) * amount,
+            )
+        current = next_pts
+    return current
 
 
 # ---------------------------------------------------------------------------
@@ -177,10 +221,10 @@ class ClothingVariantProcessor(object):
         self.logger = logger
         self.exporter = exporter
         # Shared deformation state for the Deformation Controls panel.
-        # None (the default) means "fully automatic, exactly as before"
-        # -- process_one() never requires a DeformationState, preserving
-        # backward compatibility with any external script that calls it
-        # directly.
+        # None means "fully automatic". A DeformationState whose sliders
+        # are all at their defaults is also treated as fully automatic
+        # (see DeformationState.is_identity), so the panel costs nothing
+        # until an artist actually moves something.
         self.deform_state = None
 
         # Bindings are expensive to compute (a closest-point query per
@@ -190,6 +234,29 @@ class ClothingVariantProcessor(object):
         # the difference between "runs overnight" and "finishes in a
         # coffee break". Keyed by clothing transform name.
         self._binding_cache = {}
+        # Vertex-neighbour lists for the Smooth Iterations pass, keyed the
+        # same way and released at the same time.
+        self._neighbor_cache = {}
+
+    # ------------------------------------------------------------------
+    # Cache lifetime
+    # ------------------------------------------------------------------
+    def release_clothing(self, clothing_mesh):
+        """
+        Drop every cache entry held for one clothing mesh.
+
+        BatchRunner calls this as soon as a clothing item's last target is
+        done. On a 500-asset batch the bind data would otherwise pile up
+        until the whole run is finished, for no benefit -- nothing ever
+        looks at a clothing's binding again once its targets are done.
+        """
+        self._binding_cache.pop(clothing_mesh, None)
+        self._neighbor_cache.pop(clothing_mesh, None)
+
+    def release_all(self):
+        """Drop all cached data (scene change, base body change, shutdown)."""
+        self._binding_cache.clear()
+        self._neighbor_cache.clear()
 
     # ------------------------------------------------------------------
     # Public entry point: process ONE clothing mesh for ONE target body
@@ -205,7 +272,6 @@ class ClothingVariantProcessor(object):
         target_mesh = target_body["mesh"]
         target_display = target_body["display_name"]
 
-        temp_nodes = []
         working_clothing = None
 
         try:
@@ -220,13 +286,20 @@ class ClothingVariantProcessor(object):
                 )
 
             with utils.undo_chunk("CVG_%s_%s" % (clothing_mesh, target_display)):
-                working_clothing, temp_nodes = self._deform_clothing_to_target(
+                working_clothing = self._deform_clothing_to_target(
                     clothing_mesh, target_mesh
                 )
 
-                if options.get("transfer_skin_weights"):
-                    self._transfer_skin_weights(clothing_mesh, working_clothing)
-
+                # ORDER MATTERS. History delete and freeze must both happen
+                # BEFORE the skin transfer:
+                #   * `delete -constructionHistory` would delete the very
+                #     skinCluster we just created, silently throwing away
+                #     every weight we transferred.
+                #   * `makeIdentity` refuses to freeze a skinned mesh and
+                #     errors out.
+                # Doing the cleanup first, then skinning the clean mesh,
+                # makes "Transfer Skin Weights" safe to combine with the
+                # other options instead of quietly conflicting with them.
                 if options.get("delete_history", True):
                     utils.safe_delete_history(working_clothing, self.logger)
 
@@ -236,7 +309,11 @@ class ClothingVariantProcessor(object):
                 if options.get("center_pivot", True):
                     utils.center_pivot(working_clothing, self.logger)
 
+                if options.get("transfer_skin_weights"):
+                    self._transfer_skin_weights(clothing_mesh, working_clothing)
+
                 final_name = self._rename_result(clothing_mesh, working_clothing, target_display)
+                working_clothing = final_name
 
             exported_path = None
             if options.get("export_fbx") and output_folder:
@@ -247,47 +324,57 @@ class ClothingVariantProcessor(object):
                     overwrite=options.get("overwrite_existing", False),
                 )
 
-            if options.get("keep_scene_clean", True):
-                utils.safe_delete_nodes(temp_nodes, self.logger)
-
             duration = time.time() - start_time
             self.logger.success(
                 "Generated '%s' for '%s' in %.2fs" % (final_name, target_display, duration)
             )
             return TaskResult(clothing_mesh, target_display, True, final_name,
-                               exported_path, None, duration)
+                              exported_path, None, duration)
 
-        except (ClothingProcessingError, utils.MeshValidationError) as exc:
-            utils.safe_delete_nodes(temp_nodes, self.logger)
-            if working_clothing and cmds.objExists(working_clothing):
-                utils.safe_delete_nodes([working_clothing], self.logger)
+        except (ClothingProcessingError, utils.MeshValidationError, ExportError) as exc:
+            # Expected, per-asset failures: a missing mesh, a topology
+            # mismatch, an unwritable export path. Report them plainly --
+            # they are not bugs, and the batch carries on.
+            self._discard_working(working_clothing, options)
             self.logger.error("Skipped '%s' for '%s': %s" % (clothing_mesh, target_display, exc))
             return TaskResult(clothing_mesh, target_display, False, error=str(exc),
-                               duration=time.time() - start_time)
+                              duration=time.time() - start_time)
 
         except Exception as exc:  # noqa: BLE001 - last line of defense, must never crash Maya
-            utils.safe_delete_nodes(temp_nodes, self.logger)
-            if working_clothing and cmds.objExists(working_clothing):
-                utils.safe_delete_nodes([working_clothing], self.logger)
+            self._discard_working(working_clothing, options)
             self.logger.error(
-                "Unexpected error processing '%s' for '%s': %s" % (clothing_mesh, target_display, exc)
+                "Unexpected error processing '%s' for '%s': %s"
+                % (clothing_mesh, target_display, exc)
             )
             return TaskResult(clothing_mesh, target_display, False, error=str(exc),
-                               duration=time.time() - start_time)
+                              duration=time.time() - start_time)
+
+    def _discard_working(self, working_clothing, options):
+        """
+        Remove a half-finished working mesh after a failure.
+
+        Deleted immediately rather than queued for an end-of-batch sweep:
+        a failed asset's debris should never be visible to the next task,
+        and "Keep Scene Clean" off means the artist explicitly asked to
+        inspect the wreckage.
+        """
+        if not working_clothing:
+            return
+        if not options.get("keep_scene_clean", True):
+            return
+        if cmds.objExists(working_clothing):
+            utils.safe_delete_nodes([working_clothing], self.logger)
 
     # ------------------------------------------------------------------
-    # NEW deformation transfer (pure Maya API 2.0, no deformers)
+    # Deformation transfer (pure Maya API 2.0, no deformers)
     # ------------------------------------------------------------------
     def _deform_clothing_to_target(self, clothing_mesh, target_mesh):
         """
-        Bake ``clothing_mesh`` onto ``target_mesh`` and return
-        ``(working_clothing_transform, temp_nodes_list)``.
+        Bake ``clothing_mesh`` onto ``target_mesh`` and return the new
+        working clothing transform.
 
-        Contract preserved with the outer pipeline. Because this
-        implementation creates NO helper deformers, driver duplicates,
-        blendShapes or any other DG nodes, ``temp_nodes_list`` is always
-        empty; the outer ``safe_delete_nodes(temp_nodes, ...)`` call is
-        then simply a no-op, which is what we want.
+        This creates NO helper deformers, driver duplicates, blendShapes
+        or any other DG nodes -- only the result mesh itself.
         """
         # Step 1 -- bind clothing to Base body (cached across targets).
         binding = self._get_or_build_binding(clothing_mesh)
@@ -298,14 +385,13 @@ class ClothingVariantProcessor(object):
         # Controls below.
         points, normals, surface_points = self._evaluate_binding_on_target(binding, target_mesh)
 
-        # Step 3 -- (optional) manual Deformation Controls: global
-        # influence and surface offset, then smoothing. A None
-        # deform_state means "fully automatic", i.e. the original
-        # behaviour with zero extra cost -- this step is skipped
-        # entirely.
-        if self.deform_state is not None:
+        # Step 3 -- (optional) manual Deformation Controls. Skipped
+        # entirely when the sliders are at their defaults, so the
+        # automatic path stays exactly as fast as it was.
+        state = self.deform_state
+        if state is not None and not state.is_identity():
             points = self._apply_deform_state(
-                binding, clothing_mesh, points, normals, surface_points, self.deform_state
+                binding, clothing_mesh, points, normals, surface_points, state
             )
 
         # Step 4 -- duplicate the original clothing (so we inherit its
@@ -313,52 +399,57 @@ class ClothingVariantProcessor(object):
         # point positions in-place via the mesh function set. No
         # construction history is created by MFnMesh.setPoints.
         new_points = om.MPointArray([om.MPoint(p[0], p[1], p[2]) for p in points])
-        working_clothing = self._write_result_mesh(clothing_mesh, new_points)
-
-        return working_clothing, []
+        return self._write_result_mesh(clothing_mesh, new_points)
 
     # ------------------------------------------------------------------
     # Manual Deformation Controls: scale the offset each clothing
     # vertex has from its bound surface point by the Global Body
-    # Influence, add the Global Surface Offset along the body normal,
-    # then blend toward a Laplacian-smoothed version of the result by
-    # Smoothing * Falloff.
+    # Influence, add the Surface Offset along the body normal, then
+    # optionally relax the result.
     # ------------------------------------------------------------------
     def _apply_deform_state(self, binding, clothing_mesh, points, normals, surface_points, state):
-        vcount = len(points)
         global_infl = state.global_influence
         offset_amount = state.surface_offset
 
-        out = [None] * vcount
-        for i in range(vcount):
-            p = points[i]
-            surf = surface_points[i]
-            n = normals[i]
+        # Skip the per-vertex loop when it would be an identity map --
+        # e.g. an artist using ONLY the smoothing slider.
+        if global_infl != 1.0 or offset_amount != 0.0:
+            out = [None] * len(points)
+            for i, p in enumerate(points):
+                surf = surface_points[i]
+                n = normals[i]
+                # Scale the deviation from the surface point by the Global
+                # Body Influence, then push along the normal by the
+                # (unscaled -- it's an absolute distance, not a
+                # percentage) Surface Offset.
+                out[i] = (
+                    surf[0] + (p[0] - surf[0]) * global_infl + n[0] * offset_amount,
+                    surf[1] + (p[1] - surf[1]) * global_infl + n[1] * offset_amount,
+                    surf[2] + (p[2] - surf[2]) * global_infl + n[2] * offset_amount,
+                )
+            points = out
 
-            # Scale the deviation from the surface point by the Global
-            # Body Influence, then push along the normal by the
-            # (unscaled -- it's an absolute cm value, not a percentage)
-            # Global Surface Offset.
-            dx = (p[0] - surf[0]) * global_infl + n[0] * offset_amount
-            dy = (p[1] - surf[1]) * global_infl + n[1] * offset_amount
-            dz = (p[2] - surf[2]) * global_infl + n[2] * offset_amount
-            out[i] = (surf[0] + dx, surf[1] + dy, surf[2] + dz)
+        if state.smooth_iterations > 0:
+            neighbors = self._get_or_build_neighbors(clothing_mesh)
+            points = _laplacian_smooth(
+                points, neighbors,
+                config.SMOOTH_STRENGTH_PER_ITERATION,
+                state.smooth_iterations,
+            )
 
-        if state.smoothing > 0.0:
-            neighbors = adjacency.default_cache.neighbors_for(clothing_mesh)
-            # Falloff controls how gradually smoothing spreads: low
-            # falloff -> a single gentle pass; high falloff -> more
-            # iterations so the smoothing reaches further across the
-            # mesh per slider unit of "Smoothing".
-            amount = min(1.0, state.smoothing / 100.0)
-            iterations = 1 + int(round(state.falloff * 4))
-            out = adjacency.laplacian_smooth(out, neighbors, amount * 0.5, iterations)
-
-        return out
+        return points
 
     # ------------------------------------------------------------------
     # Binding: clothing -> Base body (cached)
     # ------------------------------------------------------------------
+    def _get_or_build_neighbors(self, clothing_mesh):
+        cached = self._neighbor_cache.get(clothing_mesh)
+        if cached is not None:
+            return cached
+        neighbors = _build_vertex_neighbors(self._shape_dag_path(clothing_mesh))
+        self._neighbor_cache[clothing_mesh] = neighbors
+        return neighbors
+
     def _get_or_build_binding(self, clothing_mesh):
         """
         Return a cached ``_ClothingBinding`` for ``clothing_mesh`` if one
@@ -409,6 +500,14 @@ class ClothingVariantProcessor(object):
         # target. Face normals would break at every triangle edge.
         base_vnormals = base_fn.getVertexNormals(True, om.MSpace.kWorld)
 
+        # Marshal the API arrays into plain Python tuples ONCE. Every
+        # `mpoint.x` is a C++ boundary crossing, and the loops below touch
+        # 3 points x 3 components per vertex; paying that cost once per
+        # vertex instead of nine times per vertex is a pure win with no
+        # change to the arithmetic.
+        base_pts = [(p.x, p.y, p.z) for p in base_points]
+        base_nrm = [(n.x, n.y, n.z) for n in base_vnormals]
+
         # Per-polygon triangle counts, computed ONCE via MItMeshPolygon
         # (MFnMesh has no polygonTriangleCount() method -- the only way
         # to get a face's triangle count in the API is numTriangles()
@@ -426,6 +525,7 @@ class ClothingVariantProcessor(object):
         get_closest = base_fn.getClosestPoint
         pick_triangle = self._pick_triangle_in_polygon
         encode_offset = self._encode_offset_in_triangle_frame
+        interp_normal = self._interpolate_smooth_normal
 
         for i in range(vcount):
             v_world = clothing_points[i]
@@ -433,21 +533,19 @@ class ClothingVariantProcessor(object):
             # polygon id on the base body; that polygon may contain
             # multiple triangles (n-gons are legal on production meshes).
             surface_pt, poly_id = get_closest(v_world, kWorld)
+            surf = (surface_pt.x, surface_pt.y, surface_pt.z)
 
-            tri_verts, bary = pick_triangle(base_fn, poly_id, surface_pt, base_points, poly_tri_counts)
+            tri_verts, bary = pick_triangle(base_fn, poly_id, surf, base_pts, poly_tri_counts)
             a_idx, b_idx, c_idx = tri_verts
             u, v, w = bary
 
-            A = base_points[a_idx]
-            B = base_points[b_idx]
-            C = base_points[c_idx]
-
             # Smooth interpolated normal at the surface point.
-            n_smooth = self._interpolate_smooth_normal(
-                base_vnormals, a_idx, b_idx, c_idx, u, v, w
-            )
+            n_smooth = interp_normal(base_nrm, a_idx, b_idx, c_idx, u, v, w)
 
-            a_coef, b_coef, h_coef, _degenerate = encode_offset(A, B, C, n_smooth, v_world, surface_pt)
+            a_coef, b_coef, h_coef = encode_offset(
+                base_pts[a_idx], base_pts[b_idx], base_pts[c_idx],
+                n_smooth, (v_world.x, v_world.y, v_world.z), surf,
+            )
 
             binding.tri_a[i] = a_idx
             binding.tri_b[i] = b_idx
@@ -471,27 +569,26 @@ class ClothingVariantProcessor(object):
         plain ``(x, y, z)`` tuples in world space:
 
             points         -- final clothing vertex positions (the
-                               original, fully-automatic result)
+                              original, fully-automatic result)
             normals        -- interpolated smooth body normal at each
-                               clothing vertex's bind point, evaluated
-                               on THIS target
+                              clothing vertex's bind point, evaluated
+                              on THIS target
             surface_points -- the barycentric surface point ("P'") each
-                               clothing vertex is bound to on THIS
-                               target
+                              clothing vertex is bound to on THIS target
 
-        Plain tuples (rather than ``MPoint``/``MVector``) are returned
-        so the manual Deformation Controls step in ``process_one()`` can
-        operate on them with plain Python math, at zero Maya-API
-        object-creation cost in its hot loop. No
-        closest-point queries happen here -- everything is a fixed
-        number of vector operations per clothing vertex, so this scales
-        linearly with mesh size and is fast even for hero clothing.
+        Plain tuples (rather than ``MPoint``/``MVector``) are returned so
+        the manual Deformation Controls step can operate on them with
+        plain Python math, at zero Maya-API object-creation cost in its
+        hot loop. No closest-point queries happen here -- everything is a
+        fixed number of vector operations per clothing vertex, so this
+        scales linearly with mesh size and is fast even for hero clothing.
         """
         target_shape_path = self._shape_dag_path(target_mesh)
         target_fn = om.MFnMesh(target_shape_path)
 
-        target_points = target_fn.getPoints(om.MSpace.kWorld)
-        target_vnormals = target_fn.getVertexNormals(True, om.MSpace.kWorld)
+        target_pts = [(p.x, p.y, p.z) for p in target_fn.getPoints(om.MSpace.kWorld)]
+        target_nrm = [(n.x, n.y, n.z)
+                      for n in target_fn.getVertexNormals(True, om.MSpace.kWorld)]
 
         # Local aliases -- see comment in _build_binding for the reason.
         tri_a = binding.tri_a
@@ -503,6 +600,7 @@ class ClothingVariantProcessor(object):
         ca = binding.coord_a
         cb = binding.coord_b
         ch = binding.coord_h
+        interp_normal = self._interpolate_smooth_normal
 
         vcount = binding.vertex_count
         points = [None] * vcount
@@ -517,39 +615,30 @@ class ClothingVariantProcessor(object):
             v = bv[i]
             w = bw[i]
 
-            A = target_points[a_idx]
-            B = target_points[b_idx]
-            C = target_points[c_idx]
+            ax, ay, az = target_pts[a_idx]
+            bx, by, bz = target_pts[b_idx]
+            cx, cy, cz = target_pts[c_idx]
 
             # Barycentric surface point on the target.
-            px = A.x * u + B.x * v + C.x * w
-            py = A.y * u + B.y * v + C.y * w
-            pz = A.z * u + B.z * v + C.z * w
+            px = ax * u + bx * v + cx * w
+            py = ay * u + by * v + cy * w
+            pz = az * u + bz * v + cz * w
 
             # Interpolated smooth normal on the target.
-            n_smooth = self._interpolate_smooth_normal(
-                target_vnormals, a_idx, b_idx, c_idx, u, v, w
-            )
+            nx, ny, nz = interp_normal(target_nrm, a_idx, b_idx, c_idx, u, v, w)
 
             # Reconstruct offset in target's triangle frame.
             #   V_new = P' + a*(B'-A') + b*(C'-A') + h*N'
-            e1x = B.x - A.x
-            e1y = B.y - A.y
-            e1z = B.z - A.z
-            e2x = C.x - A.x
-            e2y = C.y - A.y
-            e2z = C.z - A.z
-
             a_coef = ca[i]
             b_coef = cb[i]
             h_coef = ch[i]
 
-            vx = px + a_coef * e1x + b_coef * e2x + h_coef * n_smooth.x
-            vy = py + a_coef * e1y + b_coef * e2y + h_coef * n_smooth.y
-            vz = pz + a_coef * e1z + b_coef * e2z + h_coef * n_smooth.z
-
-            points[i] = (vx, vy, vz)
-            normals[i] = (n_smooth.x, n_smooth.y, n_smooth.z)
+            points[i] = (
+                px + a_coef * (bx - ax) + b_coef * (cx - ax) + h_coef * nx,
+                py + a_coef * (by - ay) + b_coef * (cy - ay) + h_coef * ny,
+                pz + a_coef * (bz - az) + b_coef * (cz - az) + h_coef * nz,
+            )
+            normals[i] = (nx, ny, nz)
             surface_points[i] = (px, py, pz)
 
         return points, normals, surface_points
@@ -568,9 +657,13 @@ class ClothingVariantProcessor(object):
         positions directly to the mesh data with no construction
         history and no DG nodes created.
         """
+        # sanitize_node_name matters here: a namespaced source ("char:shirt")
+        # or a pathed one would otherwise build an invalid rename target
+        # like "CVG_tmp_char:shirt_working" and throw.
         working = utils.duplicate_mesh(
             clothing_mesh,
-            config.TEMP_PREFIX + clothing_mesh + config.WORKING_CLOTHING_SUFFIX,
+            config.TEMP_PREFIX + utils.sanitize_node_name(clothing_mesh)
+            + config.WORKING_CLOTHING_SUFFIX,
         )
 
         working_shape_path = self._shape_dag_path(working)
@@ -626,8 +719,8 @@ class ClothingVariantProcessor(object):
         For n-gons we test each internal triangle in turn: if the point
         falls strictly inside one, that's our answer; otherwise we pick
         the triangle whose barycentric coords are least negative, which
-        picks the geometrically closest sub-triangle for
-        edge-adjacent hits.
+        picks the geometrically closest sub-triangle for edge-adjacent
+        hits.
 
         ``poly_tri_counts`` is a precomputed list (index = polygon id,
         value = triangle count for that polygon), built once per Base
@@ -646,11 +739,10 @@ class ClothingVariantProcessor(object):
 
         for tri_id in range(tri_count):
             a_idx, b_idx, c_idx = base_fn.getPolygonTriangleVertices(poly_id, tri_id)
-            A = base_points[a_idx]
-            B = base_points[b_idx]
-            C = base_points[c_idx]
 
-            u, v, w = cls._barycentric(surface_pt, A, B, C)
+            u, v, w = cls._barycentric(
+                surface_pt, base_points[a_idx], base_points[b_idx], base_points[c_idx]
+            )
 
             # Score = amount by which the point falls outside this
             # triangle. Zero when strictly inside.
@@ -699,22 +791,23 @@ class ClothingVariantProcessor(object):
     def _barycentric(cls, p, a, b, c):
         """
         Barycentric coordinates of ``p`` with respect to triangle
-        ``(a, b, c)``. Returns ``(u, v, w)`` where
-        ``p ~= u*a + v*b + w*c`` and ``u + v + w == 1``.
+        ``(a, b, c)`` -- all plain ``(x, y, z)`` tuples. Returns
+        ``(u, v, w)`` where ``p ~= u*a + v*b + w*c`` and ``u + v + w == 1``.
 
         Uses the Ericson / "Real-Time Collision Detection" formulation
         (Gram matrix), which is numerically robust for the near-planar
         projection case we care about here.
         """
-        v0x = b.x - a.x
-        v0y = b.y - a.y
-        v0z = b.z - a.z
-        v1x = c.x - a.x
-        v1y = c.y - a.y
-        v1z = c.z - a.z
-        v2x = p.x - a.x
-        v2y = p.y - a.y
-        v2z = p.z - a.z
+        ax, ay, az = a
+        v0x = b[0] - ax
+        v0y = b[1] - ay
+        v0z = b[2] - az
+        v1x = c[0] - ax
+        v1y = c[1] - ay
+        v1z = c[2] - az
+        v2x = p[0] - ax
+        v2y = p[1] - ay
+        v2z = p[2] - az
 
         d00 = v0x * v0x + v0y * v0y + v0z * v0z
         d01 = v0x * v1x + v0y * v1y + v0z * v1z
@@ -736,34 +829,29 @@ class ClothingVariantProcessor(object):
         u = 1.0 - v - w
         return u, v, w
 
-    @staticmethod
-    def _interpolate_smooth_normal(vnormals, a_idx, b_idx, c_idx, u, v, w):
+    @classmethod
+    def _interpolate_smooth_normal(cls, vnormals, a_idx, b_idx, c_idx, u, v, w):
         """
         Return the barycentric interpolation of three per-vertex smooth
-        normals, renormalised. Returns an ``MVector``.
-
-        ``vnormals`` is an ``MFloatVectorArray`` from
-        ``MFnMesh.getVertexNormals``. We deliberately avoid constructing
-        an ``MVector`` per component multiplication and instead work in
-        scalars for speed.
+        normals, renormalised, as an ``(x, y, z)`` tuple.
         """
-        na = vnormals[a_idx]
-        nb = vnormals[b_idx]
-        nc = vnormals[c_idx]
+        nax, nay, naz = vnormals[a_idx]
+        nbx, nby, nbz = vnormals[b_idx]
+        ncx, ncy, ncz = vnormals[c_idx]
 
-        nx = na.x * u + nb.x * v + nc.x * w
-        ny = na.y * u + nb.y * v + nc.y * w
-        nz = na.z * u + nb.z * v + nc.z * w
+        nx = nax * u + nbx * v + ncx * w
+        ny = nay * u + nby * v + ncy * w
+        nz = naz * u + nbz * v + ncz * w
 
         length = (nx * nx + ny * ny + nz * nz) ** 0.5
-        if length < ClothingVariantProcessor._NORMAL_LENGTH_EPS:
+        if length < cls._NORMAL_LENGTH_EPS:
             # Opposing normals cancelled to zero -- extremely unlikely
             # on real character topology but must be handled. Fall back
             # to the un-averaged normal of vertex A.
-            return om.MVector(na.x, na.y, na.z)
+            return (nax, nay, naz)
 
         inv = 1.0 / length
-        return om.MVector(nx * inv, ny * inv, nz * inv)
+        return (nx * inv, ny * inv, nz * inv)
 
     @classmethod
     def _encode_offset_in_triangle_frame(cls, A, B, C, n_smooth, v_world, surface_pt):
@@ -783,21 +871,20 @@ class ClothingVariantProcessor(object):
         rather than pinching; (ii) ``h`` is measured against a
         unit-length smooth normal, so thickness is preserved.
         """
-        # Offset vector components -- inline, no MVector allocation.
-        ox = v_world.x - surface_pt.x
-        oy = v_world.y - surface_pt.y
-        oz = v_world.z - surface_pt.z
+        # Offset vector components -- inline, no vector allocation.
+        ox = v_world[0] - surface_pt[0]
+        oy = v_world[1] - surface_pt[1]
+        oz = v_world[2] - surface_pt[2]
 
-        e1x = B.x - A.x
-        e1y = B.y - A.y
-        e1z = B.z - A.z
-        e2x = C.x - A.x
-        e2y = C.y - A.y
-        e2z = C.z - A.z
+        ax, ay, az = A
+        e1x = B[0] - ax
+        e1y = B[1] - ay
+        e1z = B[2] - az
+        e2x = C[0] - ax
+        e2y = C[1] - ay
+        e2z = C[2] - az
 
-        nx = n_smooth.x
-        ny = n_smooth.y
-        nz = n_smooth.z
+        nx, ny, nz = n_smooth
 
         # det(M) = e1 . (e2 x n)
         cx = e2y * nz - e2z * ny
@@ -809,8 +896,7 @@ class ClothingVariantProcessor(object):
             # Frame is degenerate (smooth normal parallel to triangle,
             # or triangle collinear). Fall back to a pure-normal offset:
             # h is the along-normal component, tangential terms are 0.
-            h = ox * nx + oy * ny + oz * nz
-            return 0.0, 0.0, h, True
+            return 0.0, 0.0, ox * nx + oy * ny + oz * nz
 
         inv_det = 1.0 / det
 
@@ -832,10 +918,10 @@ class ClothingVariantProcessor(object):
         c3z = e1x * e2y - e1y * e2x
         h_coef = (ox * c3x + oy * c3y + oz * c3z) * inv_det
 
-        return a_coef, b_coef, h_coef, False
+        return a_coef, b_coef, h_coef
 
     # ------------------------------------------------------------------
-    # Skin weights (optional) -- UNCHANGED from the original pipeline
+    # Skin weights (optional)
     # ------------------------------------------------------------------
     def _transfer_skin_weights(self, source_clothing, new_clothing):
         skin = utils.get_skin_cluster(source_clothing)
@@ -853,12 +939,14 @@ class ClothingVariantProcessor(object):
             return False
 
         try:
-            new_skin_name = utils.unique_name(new_clothing + "_skinCluster")
+            new_skin_name = utils.unique_name(
+                utils.sanitize_node_name(new_clothing) + "_skinCluster"
+            )
             cmds.skinCluster(influences, new_clothing, toSelectedBones=True,
-                              name=new_skin_name, removeUnusedInfluence=False)
+                             name=new_skin_name, removeUnusedInfluence=False)
             cmds.copySkinWeights(sourceSkin=skin, destinationSkin=new_skin_name,
-                                  noMirror=True, surfaceAssociation="closestPoint",
-                                  influenceAssociation=["oneToOne", "closestJoint"])
+                                 noMirror=True, surfaceAssociation="closestPoint",
+                                 influenceAssociation=["oneToOne", "closestJoint"])
             return True
         except RuntimeError as exc:
             self.logger.warning(
@@ -867,17 +955,17 @@ class ClothingVariantProcessor(object):
             return False
 
     # ------------------------------------------------------------------
-    # Renaming -- UNCHANGED
+    # Renaming
     # ------------------------------------------------------------------
     def _rename_result(self, original_clothing, working_clothing, target_display):
-        base_name = utils.strip_namespace(original_clothing)
+        base_name = utils.sanitize_node_name(original_clothing)
         desired = "%s_%s" % (base_name, utils.sanitize_folder_component(target_display))
         final_name = utils.unique_name(desired)
         return cmds.rename(working_clothing, final_name)
 
 
 # ---------------------------------------------------------------------------
-# Batch orchestration -- UNCHANGED
+# Batch orchestration
 # ---------------------------------------------------------------------------
 class BatchRunner(object):
     """
@@ -894,7 +982,8 @@ class BatchRunner(object):
     caches a per-clothing binding to the Base body: all targets for one
     clothing are consumed back-to-back, so the (expensive) closest-point
     binding is computed once per clothing and reused across every
-    target variant.
+    target variant -- and can then be released the moment that
+    clothing's last target is done.
     """
 
     def __init__(self, processor, clothing_list, target_bodies, options,
@@ -912,17 +1001,18 @@ class BatchRunner(object):
         self.paused = False
         self.results = []
         self._task_durations = []
-        self._vertex_counts = []
         self.start_time = None
 
     def cancel(self):
         self.cancelled = True
 
     def pause(self):
-        """Pause between tasks -- Part 10. The current task always
-        finishes first; run_next() simply becomes a no-op while paused,
-        so the UI timer can keep ticking (updating elapsed time) without
-        starting new work."""
+        """
+        Pause between tasks. The current task always finishes first;
+        run_next() simply becomes a no-op while paused, so the UI timer
+        can keep ticking (updating elapsed time) without starting new
+        work.
+        """
         self.paused = True
 
     def resume(self):
@@ -934,54 +1024,60 @@ class BatchRunner(object):
     def is_finished(self):
         return self.cancelled or self.index >= self.total
 
+    def failed_count(self):
+        return sum(1 for r in self.results if not r.success)
+
     def retry_failed(self):
-        """Re-queue every failed task (Part 10: Retry Failed Items) by
-        appending them to the end of the task list and clearing their
-        prior failure results. Safe to call once the batch has finished
-        (partially or fully) but not while it is still mid-run."""
+        """
+        Re-queue every failed task as a fresh mini-batch.
+
+        Deliberately starts a clean run over just the failed items rather
+        than splicing them onto the finished queue: the previous version
+        appended the retries but rewound `index` to the number of
+        SUCCESSES, which re-ran already-succeeded tasks and wrote their
+        FBX a second time. A retry pass is its own small batch -- simple,
+        and impossible to double-process.
+        """
         failed_tasks = [
-            self.tasks[i] for i, r in enumerate(self.results) if not r.success
+            task for task, result in zip(self.tasks, self.results) if not result.success
         ]
         if not failed_tasks:
             return 0
-        # Drop the failed results so stats_summary() doesn't double
-        # count them, then re-append the tasks for another pass.
-        self.results = [r for r in self.results if r.success]
-        self.tasks = self.tasks[:self.index] + failed_tasks
-        self.total = len(self.tasks)
-        self.index = len(self.results)
+        self.tasks = failed_tasks
+        self.total = len(failed_tasks)
+        self.index = 0
+        self.results = []
+        self._task_durations = []
+        self.start_time = None
         self.cancelled = False
         self.paused = False
         return len(failed_tasks)
 
     def run_next(self):
-        """Process exactly one task. Returns the TaskResult, or None if
+        """
+        Process exactly one task. Returns the TaskResult, or None if
         finished OR currently paused (paused is intentionally distinct
-        from finished so the UI can tell them apart)."""
+        from finished so the UI can tell them apart).
+        """
         if self.is_finished() or self.paused:
             return None
         if self.start_time is None:
             self.start_time = time.time()
+
         clothing, target = self.tasks[self.index]
         result = self.processor.process_one(clothing, target, self.options, self.output_folder)
         self.results.append(result)
         self._task_durations.append(result.duration)
-        self._vertex_counts.append(utils.vertex_count(clothing) if utils.node_exists_and_is_mesh(clothing) else 0)
         self.index += 1
+
+        # Free this clothing's cached bind data as soon as its last target
+        # is done. Task order guarantees all of a clothing's targets are
+        # consecutive, so a change of clothing means the previous one is
+        # finished with for good.
+        if self.index >= self.total or self.tasks[self.index][0] != clothing:
+            self.processor.release_clothing(clothing)
+
         return result
-
-    def current_vertex_count(self):
-        return self._vertex_counts[-1] if self._vertex_counts else 0
-
-    def processing_speed(self):
-        """Vertices processed per second, averaged over the batch so
-        far -- shown in the UI's Processing Statistics row."""
-        if not self._task_durations or self.start_time is None:
-            return 0.0
-        elapsed = time.time() - self.start_time
-        if elapsed <= 0:
-            return 0.0
-        return sum(self._vertex_counts) / elapsed
 
     def elapsed_seconds(self):
         if self.start_time is None:
@@ -998,17 +1094,14 @@ class BatchRunner(object):
         if not self._task_durations:
             return None
         avg = sum(self._task_durations) / len(self._task_durations)
-        remaining = self.total - self.index
-        return avg * remaining
+        return avg * (self.total - self.index)
 
     def stats_summary(self):
         succeeded = sum(1 for r in self.results if r.success)
-        failed = sum(1 for r in self.results if not r.success)
-        total_time = sum(r.duration for r in self.results)
         return {
             "total": self.total,
             "processed": self.index,
             "succeeded": succeeded,
-            "failed": failed,
-            "total_time": total_time,
+            "failed": len(self.results) - succeeded,
+            "total_time": sum(r.duration for r in self.results),
         }

@@ -3,21 +3,22 @@
 ## Architecture
 
 ```
-ui.py         -- PySide2 dockable window. Gathers user intent only.
+ui.py           -- PySide2/6 dockable window. Gathers user intent only.
    |
    v
-processor.py  -- ClothingVariantProcessor (per-task pipeline)
-                 BatchRunner (task queue, progress, cancel, stats)
+processor.py    -- ClothingVariantProcessor (per-task pipeline)
+                   BatchRunner (task queue, progress, cancel, stats)
    |
-   +--> utils.py     -- defensive Maya helper functions
-   +--> exporter.py  -- FBXExporter (fbxmaya via MEL)
-   +--> logger.py    -- VariantLogger (Qt signal + log.txt)
-config.py     -- constants shared by every module
+   +--> utils.py        -- defensive Maya helper functions
+   +--> exporter.py     -- FBXExporter (fbxmaya via MEL)
+   +--> logger.py       -- VariantLogger (Qt signal + log.txt)
+   +--> deform_state.py -- plain-data slider values
+config.py       -- constants shared by every module
 ```
 
-`ui.py` never calls `maya.cmds` for scene mutation directly except for
-gathering selections/validating meshes for user feedback -- all actual
-geometry processing goes through `processor.py` so it can be reused
+`ui.py` never calls `maya.cmds` for scene mutation directly except to
+gather selections and validate meshes for user feedback -- all actual
+geometry processing goes through `processor.py`, so it can be reused
 headlessly (e.g. from a batch/farm script) without the UI at all:
 
 ```python
@@ -37,99 +38,142 @@ options = {
     "overwrite_existing": True, "keep_scene_clean": True,
 }
 runner = BatchRunner(processor, ["Shirt01", "Pants02"], targets, options,
-                      "C:/exports", logger)
+                     "C:/exports", logger)
 while not runner.is_finished():
     runner.run_next()
 print(runner.stats_summary())
 ```
 
+`processor.py` has zero PySide/UI dependencies. Deformation sliders are
+optional: leave `processor.deform_state = None` for the fully automatic
+result.
+
 ## The deformation transfer technique
 
 Maya has no single command that says "reshape this mesh the way body A
-reshapes into body B". `processor._deform_clothing_to_target()` builds
-that behavior out of two standard deformers:
+reshapes into body B". The clothing and the bodies do **not** share
+topology with each other (a shirt has far fewer vertices than a full
+body), so a blendShape between them is impossible, and a wrap deformer
+brings a whole DG subgraph that has to be built and torn down per asset.
 
-1. **Wrap deformer** (`_create_wrap_deformer`): the clothing is bound to
-   a duplicate of the Base body ("the wrap driver") using
-   `doWrapArgList` (the same MEL routine Maya's own **Deform > Wrap**
-   menu item calls -- `maya.cmds` has no first-class `wrap` command).
-   Because the wrap driver starts out shaped exactly like the Base body
-   (the shape the clothing was authored against), the bind has zero
-   initial offset.
+Instead, `processor.py` computes the transfer directly on mesh data via
+`maya.api.OpenMaya`. Nothing is added to the DG at all -- the only node
+created is the result mesh itself.
 
-2. **BlendShape** (`_apply_body_delta`): a blendShape is added to the
-   wrap driver duplicate with the *Target* body as its target shape,
-   weight driven to `1.0`. Since Base and Target share identical vertex
-   order, this reshapes the driver into the Target body's exact form.
-   The wrap deformer, still bound to that driver, propagates the same
-   delta onto the clothing -- the same principle as skin following a
-   joint, but here a mesh follows another mesh's shape change.
+### Bind (once per clothing mesh, cached across every target)
 
-3. `cmds.delete(..., constructionHistory=True)` bakes the result into
-   plain vertex positions, after which every temporary node (wrap
-   driver duplicate, wrap node, blendShape node, and Maya's own hidden
-   wrap "base" shape) is deleted.
+For every clothing vertex `V` in world space:
 
-### Why not a direct blendShape on the clothing itself?
+1. `MFnMesh.getClosestPoint` finds the closest point `P` on the Base
+   body, and the polygon id containing it.
+2. That polygon's triangles are enumerated (counts precomputed once via
+   `MItMeshPolygon.numTriangles()`; `MFnMesh` has no per-polygon
+   triangle-count method) and the triangle actually containing `P` is
+   chosen -- or, for edge/corner hits, the one whose barycentric
+   coordinates are least negative.
+3. The barycentric coordinates `(u, v, w)` of `P` in triangle `(A, B, C)`
+   are computed with the Ericson/Gram-matrix formulation.
+4. A smooth normal `N` at `P` is interpolated from the base body's
+   angle-weighted vertex normals. (Face normals would break at every
+   triangle edge and stair-step the result.)
+5. The offset `O = V - P` is expressed in the triangle-local basis
+   `[E1 | E2 | N]`, where `E1 = B - A`, `E2 = C - A`, by solving
+   `M * [a; b; h] = O` with Cramer's rule.
 
-The clothing and the bodies do **not** share topology with each other
-(a shirt has far fewer vertices than a full body), so a blendShape
-cannot be created directly between clothing and body. The wrap
-deformer is exactly the tool designed to let a low-vertex mesh follow
-the shape changes of a different-topology influence mesh.
+Stored per clothing vertex: `(a_idx, b_idx, c_idx, u, v, w, a, b, h)` --
+9 floats + 3 ints, under a megabyte for a 20k-vertex mesh.
 
-### Known limitations / assumptions (document before extending)
+That basis is deliberately **not** orthonormalised. When a target
+triangle stretches -- say across a fat belly -- `a*E1 + b*E2` stretches
+with it, so a shirt widens instead of pinching; while `h` is measured
+against a unit-length normal, so thickness is preserved.
+
+### Evaluate (per target body, no closest-point queries)
+
+```
+P' = u*A' + v*B' + w*C'
+N' = normalize(u*N'a + v*N'b + w*N'c)
+V_new = P' + a*(B' - A') + b*(C' - A') + h*N'
+```
+
+The whole point set is written in one `MFnMesh.setPoints` call.
+
+### Optional manual controls (`deform_state.py`)
+
+Applied after evaluation, and skipped entirely when
+`DeformationState.is_identity()`:
+
+- **Global Body Influence** scales `V_new - P'` (0 collapses the clothing
+  onto the body, 1 is the automatic fit, >1 exaggerates).
+- **Surface Offset** adds `N' * offset` (an absolute distance, not a
+  percentage) -- the fix for clothing poking through a body.
+- **Smooth Iterations** runs Laplacian relax passes over the clothing's
+  own vertex-neighbour graph (built once per mesh and cached alongside
+  the bind data).
+
+## Caching and memory
+
+Two caches live on the processor instance (never at module level, so
+nothing outlives the window):
+
+- `_binding_cache` -- bind data per clothing mesh.
+- `_neighbor_cache` -- vertex adjacency per clothing mesh, for smoothing.
+
+`BatchRunner` orders tasks `for clothing: for target:` precisely so every
+target for one clothing is consumed back-to-back. The expensive bind runs
+once per clothing rather than once per clothing*target, and
+`processor.release_clothing()` frees it the moment that clothing's last
+target completes. `release_all()` is called on scene change, base-body
+change and window close.
+
+## Known limitations / assumptions
 
 - **Topology-match check is vertex-count based**
-  (`utils.topology_matches`). This is a fast proxy, not a proof of
-  point-order identity. If your body variants are *not* guaranteed
-  point-order-identical (e.g. sourced from different sculpts, not a
-  shared blendShape rig), replace this check with a stricter topology
-  hash before trusting the results.
-- **Wrap deformer cleanup is best-effort.** Maya's wrap setup creates
-  an internal hidden "base" mesh whose exact naming can vary slightly
-  by Maya version/service pack. `_create_wrap_deformer` detects new
-  mesh nodes created during the call and marks them for cleanup, which
-  is robust in testing across Maya 2022-2024 but should be re-verified
-  if Autodesk changes the wrap deformer's internal node graph.
+  (`utils.topology_matches`). A fast proxy, not a proof of point-order
+  identity. If your body variants are not guaranteed point-order-identical
+  (e.g. sourced from separate sculpts), replace this with a topology hash
+  before trusting the results.
 - **Skin weight transfer assumes closest-point / closest-joint
-  association** (`cmds.copySkinWeights`), which works well when Base
-  and Target bodies share a skeleton and similar proportions. Extreme
-  body types (e.g. "Monster" with extra limbs) may need a custom
-  influence mapping -- extend `_transfer_skin_weights` with an explicit
-  `influenceAssociation` list if so.
+  association** (`cmds.copySkinWeights`), which works well when Base and
+  Target share a skeleton and similar proportions. Extreme bodies (a
+  "Monster" with extra limbs) may need an explicit influence mapping in
+  `_transfer_skin_weights`.
+- **Option order is load-bearing.** History delete and freeze must run
+  before the skin transfer: `delete -constructionHistory` would remove the
+  new skinCluster, and `makeIdentity` refuses to freeze a skinned mesh.
 - **No true multi-threading.** `maya.cmds` is not thread-safe, so
-  `BatchRunner.run_next()` is driven by a `QTimer` one task at a time
-  from `ui.py`, rather than a Python `threading.Thread`. This keeps the
-  UI responsive and Cancel effective between tasks without ever calling
-  Maya API from a non-main thread.
+  `BatchRunner.run_next()` is driven one task per `QTimer` tick from
+  `ui.py` rather than a `threading.Thread`. This keeps the UI responsive
+  and Cancel effective between tasks without ever calling Maya from a
+  non-main thread.
 - **Clothing-folder import** (`ui._on_load_clothing_folder`) only
-  recognizes `.ma`/`.mb` files. Extend it if your pipeline stores
-  clothing as `.fbx` or `.obj` references.
+  recognizes `.ma`/`.mb`. It adds only meshes reported by
+  `cmds.file(..., returnNewNodes=True)`, so it will not sweep up the body
+  meshes already in the scene.
+- **Viewport refresh is suspended for the whole batch.** Any new early
+  return in the batch path must still reach `utils.resume_viewport()`, or
+  the artist is left with a frozen viewport.
 
 ## Extending
 
 - **New body-variant presets:** edit `config.DEFAULT_BODY_VARIANT_PRESETS`.
 - **New export formats:** add a sibling to `exporter.FBXExporter` (e.g.
   `OBJExporter`) and let `ui.py`'s options section choose between them.
-- **Custom deformation technique:** everything deformation-specific
-  lives in `processor._deform_clothing_to_target` and its two helper
-  methods -- swap in a different technique (e.g. a proximity wrap, or a
-  vertex-delta transfer via `maya.api.OpenMaya` `MFnMesh.setPoints`)
-  without touching `ui.py` or `exporter.py`.
-- **Headless/batch-farm usage:** see the code sample above -- `processor.py`
-  has zero PySide2/UI dependencies.
+- **Studio FBX presets:** extend `FBXExporter._apply_export_settings` --
+  every `FBXExport*` MEL call lives in that one method.
+- **Custom deformation technique:** everything deformation-specific lives
+  in `processor._deform_clothing_to_target` and its bind/evaluate helpers;
+  swap it out without touching `ui.py` or `exporter.py`.
 
 ## Coding conventions used throughout
 
 - Every Maya-mutating call that can throw `RuntimeError` is wrapped and
   converted into either a caught `ClothingProcessingError` /
-  `MeshValidationError` (per-task, recoverable) or logged and
-  swallowed (best-effort cleanup) -- nothing is allowed to propagate
-  and crash Maya.
+  `MeshValidationError` / `ExportError` (per-task, recoverable) or logged
+  and swallowed (best-effort cleanup). Nothing is allowed to propagate and
+  crash Maya, and one bad asset never stops a batch.
 - `utils.undo_chunk()` wraps each clothing/target pair into one atomic
-  undo chunk to keep Maya's undo queue from growing unbounded across a
-  large batch.
-- All temporary nodes are prefixed with `config.TEMP_PREFIX` so they are
-  easy to spot (or scripted-delete) if a batch is interrupted outside
-  the tool's own cleanup path (e.g. a Maya crash mid-batch).
+  undo chunk, so the undo queue doesn't grow unbounded across a batch.
+- All temporary nodes are prefixed with `config.TEMP_PREFIX`, so debris
+  from an interrupted batch is easy to find -- `utils.delete_leftover_temp_nodes()`
+  sweeps them at the start of each run.

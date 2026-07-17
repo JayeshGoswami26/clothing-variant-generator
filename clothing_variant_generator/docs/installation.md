@@ -2,7 +2,9 @@
 
 ## Requirements
 
-- Autodesk Maya 2022 or newer (ships with Python 3 and PySide2 by default)
+- Autodesk Maya 2022 or newer, with Python 3. Maya 2022-2024 (PySide2/Qt5)
+  and Maya 2025+ (PySide6/Qt6) are both supported -- the plugin detects
+  which is present and adapts.
 - The `fbxmaya` plugin (ships with Maya; the plugin loads it on demand,
   no manual setup required)
 
@@ -45,14 +47,13 @@ If you edit the source after Maya is already running, reload with:
 
 ```python
 import importlib
-import clothing_variant_generator
 import clothing_variant_generator.main as cvg_main
-importlib.reload(clothing_variant_generator.config)
-importlib.reload(clothing_variant_generator.utils)
-importlib.reload(clothing_variant_generator.logger)
-importlib.reload(clothing_variant_generator.processor)
-importlib.reload(clothing_variant_generator.exporter)
-importlib.reload(clothing_variant_generator.ui)
+
+# Reload in dependency order (config first, ui last).
+for module in ("config", "utils", "logger", "deform_state",
+               "exporter", "processor", "ui"):
+    importlib.reload(importlib.import_module(
+        "clothing_variant_generator." + module))
 importlib.reload(cvg_main)
 cvg_main.show()
 ```
@@ -82,7 +83,7 @@ For distributing to a whole team, create a `.mod` file, e.g.
 `MAYA_MODULE_PATH`:
 
 ```
-+ clothing_variant_generator 1.0 /path/to/parent/of/clothing_variant_generator
++ clothing_variant_generator 3.1 /path/to/parent/of/clothing_variant_generator
 ```
 
 This lets every artist load the tool without manually copying files to
